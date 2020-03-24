@@ -42,6 +42,7 @@
 #endif
 
 #ifdef HAVE_LIBSSL
+# include <openssl/evp.h>
 enum { SSL_None, SSL_STARTTLS, SSL_IMAPS };
 #endif
 
@@ -2108,14 +2109,91 @@ done_sasl_auth( imap_store_t *ctx, imap_cmd_t *cmd ATTR_UNUSED, int response )
 
 #endif
 
+static size_t
+encoded_length( size_t in )
+{
+	in += 2;
+	in /= 3;
+	in <<= 2;
+	in++;
+
+	return in;
+}
+
+static int
+auth_builtin_oauthbearer( imap_store_t *ctx )
+{
+	imap_store_conf_t *cfg = (imap_store_conf_t *)ctx->gen.conf;
+	imap_server_conf_t *srvc = cfg->server;
+	size_t buf_size = 38; /* format string, port, NULL */
+	size_t input_size;
+	char *buf, *buf_encoded;
+
+#ifdef HAVE_LIBSSL
+	if (!ctx->conn.ssl) {
+#endif
+		error( "Note: not using OAUTHBEARER because connection is not encrypted;\n" );
+		return -1;
+#ifdef HAVE_LIBSSL
+	}
+#endif
+
+	if (!ensure_user( srvc ) || !ensure_password( srvc ))
+		return -1;
+
+	buf_size += strlen( srvc->user );
+	buf_size += strlen( srvc->sconf.host );
+	buf_size += strlen( srvc->pass );
+
+	buf = nfmalloc( buf_size );
+	input_size = nfsnprintf( buf, buf_size, "n,a=%s,\001host=%s\001port=%d\001auth=Bearer %s\001\001",
+	            srvc->user, srvc->sconf.host, srvc->sconf.port, srvc->pass );
+
+	buf_encoded = nfmalloc ( encoded_length( input_size ) );
+
+#ifdef HAVE_LIBSSL
+	EVP_EncodeBlock( (unsigned char *)buf_encoded, (unsigned char *)buf, input_size );
+#endif
+
+	imap_exec( ctx, 0, imap_open_store_authenticate2_p2,
+	           "AUTHENTICATE OAUTHBEARER %s", buf_encoded );
+
+	free ( buf_encoded );
+	free ( buf );
+
+	return 0;
+}
+
+static int
+auth_builtin_login( imap_store_t *ctx )
+{
+	imap_store_conf_t *cfg = (imap_store_conf_t *)ctx->gen.conf;
+	imap_server_conf_t *srvc = cfg->server;
+
+	if (!ensure_user( srvc ) || !ensure_password( srvc ))
+		return -1;
+
+#ifdef HAVE_LIBSSL
+	if (!ctx->conn.ssl)
+#endif
+		warn( "*** IMAP Warning *** Password is being sent in the clear\n" );
+	imap_exec( ctx, 0, imap_open_store_authenticate2_p2,
+		   "LOGIN \"%\\s\" \"%\\s\"", srvc->user, srvc->pass );
+
+	return 0;
+}
+
+#define AUTH_BUILTIN_LOGIN		0x1
+#define AUTH_BUILTIN_OAUTHBEARER	0x2
+
 static void
 imap_open_store_authenticate2( imap_store_t *ctx )
 {
 	imap_store_conf_t *cfg = (imap_store_conf_t *)ctx->gen.conf;
 	imap_server_conf_t *srvc = cfg->server;
 	string_list_t *mech, *cmech;
-	int auth_login = 0;
-	int skipped_login = 0;
+	int auth_builtin = 0;
+	int skipped_builtin = 0;
 #ifdef HAVE_LIBSASL
 	const char *saslavail;
 	char saslmechs[1024], *saslend = saslmechs;
@@ -2126,15 +2204,19 @@ imap_open_store_authenticate2( imap_store_t *ctx )
 		int any = !strcmp( mech->string, "*" );
 		for (cmech = ctx->auth_mechs; cmech; cmech = cmech->next) {
 			if (any || !strcasecmp( mech->string, cmech->string )) {
-				if (!strcasecmp( cmech->string, "LOGIN" )) {
+				if (!strcasecmp( cmech->string, "LOGIN" ))
+					auth_builtin |= AUTH_BUILTIN_LOGIN;
+				if (!strcasecmp( cmech->string, "OAUTHBEARER" ))
+					auth_builtin |= AUTH_BUILTIN_OAUTHBEARER;
+				if (auth_builtin & (AUTH_BUILTIN_LOGIN | AUTH_BUILTIN_OAUTHBEARER)) {
 #ifdef HAVE_LIBSSL
-					if (ctx->conn.ssl || !any)
+					if (!ctx->conn.ssl && any) {
 #else
-					if (!any)
+					if (any) {
 #endif
-						auth_login = 1;
-					else
-						skipped_login = 1;
+						auth_builtin = 0;
+						skipped_builtin = 1;
+					}
 #ifdef HAVE_LIBSASL
 				} else {
 					int len = strlen( cmech->string );
@@ -2202,7 +2284,7 @@ imap_open_store_authenticate2( imap_store_t *ctx )
 	  notsasl:
 		if (!ctx->sasl || sasl_listmech( ctx->sasl, NULL, "", " ", "", &saslavail, NULL, NULL ) != SASL_OK)
 			saslavail = "(none)";  /* EXTERNAL is always there anyway. */
-		if (!auth_login) {
+		if (!auth_builtin) {
 			error( "IMAP error: selected SASL mechanism(s) not available;\n"
 			       "   selected:%s\n   available: %s\n", saslmechs, saslavail );
 			goto skipnote;
@@ -2211,24 +2293,21 @@ imap_open_store_authenticate2( imap_store_t *ctx )
 		sasl_dispose( &ctx->sasl );
 	}
 #endif
-	if (auth_login) {
-		if (!ensure_user( srvc ) || !ensure_password( srvc ))
-			goto bail;
-#ifdef HAVE_LIBSSL
-		if (!ctx->conn.ssl)
-#endif
-			warn( "*** IMAP Warning *** Password is being sent in the clear\n" );
-		imap_exec( ctx, 0, imap_open_store_authenticate2_p2,
-		           "LOGIN \"%\\s\" \"%\\s\"", srvc->user, srvc->pass );
-		return;
+	if (auth_builtin & AUTH_BUILTIN_LOGIN) {
+		if ( !auth_builtin_login( ctx ))
+			return;
+	}
+	if (auth_builtin & AUTH_BUILTIN_OAUTHBEARER) {
+		if ( !auth_builtin_oauthbearer( ctx ))
+			return;
 	}
 	error( "IMAP error: server supports no acceptable authentication mechanism\n" );
 #ifdef HAVE_LIBSASL
   skipnote:
 #endif
-	if (skipped_login)
-		error( "Note: not using LOGIN because connection is not encrypted;\n"
-		       "      use 'AuthMechs LOGIN' explicitly to force it.\n" );
+	if (skipped_builtin)
+		error( "Note: not using builtin authentication because connection is not encrypted;\n"
+		       "      use e.g. 'AuthMechs LOGIN' explicitly to force it.\n" );
 
   bail:
 	imap_open_store_bail( ctx, FAIL_FINAL );
